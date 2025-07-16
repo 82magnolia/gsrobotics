@@ -15,7 +15,7 @@ imgw = 640 # FULLWIDTH
 imgh = 480 # FULLHEIGHT
 brd_frac = 0.15
 
-DEVICE_ID = 0 # Change this field if device ID differs
+DEVICE_ID = 1 # Change this field if device ID differs
 
 def show_image():
     counter = 0

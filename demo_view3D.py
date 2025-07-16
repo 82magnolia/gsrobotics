@@ -1,3 +1,5 @@
+import os
+from datetime import datetime
 import cv2
 import numpy as np
 from config import ConfigModel
@@ -85,6 +87,9 @@ def UpdateView(
     # Show the combined image.
     cv2.imshow(window_title, display_frame)
 
+    # depth_map 반환
+    return depth_map
+
 
 def View3D(config: ConfigModel):
     WINDOW_TITLE = "Multi-View (Camera, Contact, Depth)"
@@ -126,6 +131,12 @@ def View3D(config: ConfigModel):
     cam_stream.select_device(config.default_camera_index)
     cam_stream.start()
 
+    # save directory 설정
+    SAVE_DIR = "/home/junwon/Projects/test"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    date_str = datetime.now().strftime("%m%d%H%M")
+    save_counter = 0
+
     # Main loop: capture frames, compute depth map, and update the 3D view.
     try:
         while True:
@@ -137,7 +148,7 @@ def View3D(config: ConfigModel):
             # Convert color
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            UpdateView(
+            depth_map = UpdateView(
                 image=frame,
                 cam_stream=cam_stream,
                 reconstruction=reconstruction,
@@ -147,11 +158,39 @@ def View3D(config: ConfigModel):
                 window_title=WINDOW_TITLE,
             )
 
+            key = cv2.waitKey(1) & 0xFF
+
             # Exit conditions.
             # When press 'q' on keyboard
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            if key == ord("q"):
+                log_message(f"exit conditions")
                 break
+                
+            # save when press "s" on keyboard
+            if key == ord("s"):
+                filename = f"{date_str}_{save_counter}"
+                depth_filename = os.path.join(SAVE_DIR, f"depth_{filename}.npy")
+                np.save(depth_filename, depth_map)
 
+                depth_filename = os.path.join(SAVE_DIR, f"depth_{filename}.csv")
+                np.savetxt(
+                    depth_filename,
+                    depth_map,
+                    delimiter=",",
+                    fmt="%.2f"
+                )
+
+                if visualizer3D:
+                    pcd_filename = os.path.join(SAVE_DIR, f"pcd_{filename}.pcd")
+                    visualizer3D.save_pointcloud(pcd_filename)
+                
+                rgb_filename = os.path.join(SAVE_DIR, f"rgb_{filename}.png")
+                img2save = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(rgb_filename, img2save)
+
+                log_message(f"Saved data depth & pcd & rgb to {SAVE_DIR} folder.")
+                save_counter += 1
+            
             # Check if the window has been closed by the user.
             # cv2.getWindowProperty returns a value < 1 when the window is closed.
             if cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:

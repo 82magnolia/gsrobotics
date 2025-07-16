@@ -166,6 +166,7 @@ class Visualize3D:
         self.visualizer.poll_events()
         self.visualizer.update_renderer()
 
+        '''
         # Save the current point cloud to a file if a save path is provided.
         if self.save_path != "":
             filename = f"{self.save_path}/pc_{self.file_counter}.pcd"
@@ -173,12 +174,13 @@ class Visualize3D:
 
         # Increment the file counter.
         self.file_counter += 1
+        '''
 
-    def save_pointcloud(self) -> None:
+    def save_pointcloud(self, filename: str) -> None:
         """
         Save the current point cloud to a file.
 
         The file is saved using the current counter value as a name postfix.
         """
-        filename = f"{self.save_path}/pointcloud_{self.file_counter}.pcd"
+        # filename = f"{self.save_path}/pointcloud_{self.file_counter}.pcd"
         open3d.io.write_point_cloud(filename, self.pointcloud)
