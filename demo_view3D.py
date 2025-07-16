@@ -15,7 +15,6 @@ from utilities.visualization import Visualize3D
 from utilities.gelsightmini import GelSightMini
 from utilities.logger import log_message
 
-
 def UpdateView(
     image: np.ndarray,
     cam_stream: GelSightMini,
@@ -168,6 +167,7 @@ def View3D(config: ConfigModel):
                 
             # save when press "s" on keyboard
             if key == ord("s"):
+                # save depth_map
                 filename = f"{date_str}_{save_counter}"
                 depth_filename = os.path.join(SAVE_DIR, f"depth_{filename}.npy")
                 np.save(depth_filename, depth_map)
@@ -180,10 +180,12 @@ def View3D(config: ConfigModel):
                     fmt="%.2f"
                 )
 
+                # save pointcloud
                 if visualizer3D:
                     pcd_filename = os.path.join(SAVE_DIR, f"pcd_{filename}.pcd")
                     visualizer3D.save_pointcloud(pcd_filename)
                 
+                # save img
                 rgb_filename = os.path.join(SAVE_DIR, f"rgb_{filename}.png")
                 img2save = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(rgb_filename, img2save)
