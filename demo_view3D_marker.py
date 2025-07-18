@@ -1,0 +1,331 @@
+import os
+from datetime import datetime
+import cv2
+import numpy as np
+from config import ConfigModel
+from utilities.image_processing import (
+    stack_label_above_image,
+    apply_cmap,
+    color_map_from_txt,
+    normalize_array,
+    trim_outliers,
+)
+from utilities.reconstruction import Reconstruction3D
+from utilities.visualization import Visualize3D
+from utilities.gelsightmini import GelSightMini
+from utilities.logger import log_message
+from utilities.marker_tracker import MarkerTracker
+
+def UpdateView(
+    image: np.ndarray,
+    cam_stream: GelSightMini,
+    reconstruction: Reconstruction3D,
+    visualizer3D: Visualize3D,
+    cmap: np.ndarray,
+    config: ConfigModel,
+    window_title: str,
+    marker_frame: np.ndarray,  # marker tracker 추가
+):
+
+    # Compute depth map and gradients.
+    depth_map, contact_mask, grad_x, grad_y = reconstruction.get_depthmap(
+        image=image,
+        markers_threshold=(config.marker_mask_min, config.marker_mask_max),
+    )
+
+    if visualizer3D:
+        visualizer3D.update(depth_map, gradient_x=grad_x, gradient_y=grad_y)
+
+    if np.isnan(depth_map).any():
+        return
+
+    depth_map_trimmed = trim_outliers(depth_map, 1, 99)
+    depth_map_normalized = normalize_array(array=depth_map_trimmed, min_divider=10)
+    depth_rgb = apply_cmap(data=depth_map_normalized, cmap=cmap)
+
+    # Convert masks to 8-bit grayscale.
+    contact_mask = (contact_mask * 255).astype(np.uint8)
+
+    # Convert grayscale images to 3-channel for stacking.
+    contact_mask_rgb = cv2.cvtColor(contact_mask, cv2.COLOR_GRAY2BGR)
+
+    # Apply labels above images
+    frame_labeled = stack_label_above_image(
+        image, f"Camera Feed {int(cam_stream.fps)} FPS", 30
+    )
+
+    depth_labeled = stack_label_above_image(depth_rgb, "Depth", 30)
+    contact_mask_labeled = stack_label_above_image(contact_mask_rgb, "Contact Mask", 30)
+    marker_labeled = stack_label_above_image(marker_frame, "Marker Tracker", 30)
+    # Increase spacing between images by adding black spacers
+    spacing_size = 30
+    horizontal_spacer = np.zeros(
+        (frame_labeled.shape[0], spacing_size, 3), dtype=np.uint8
+    )
+    
+    top_row = np.hstack(
+        (
+            frame_labeled,
+            horizontal_spacer,
+            contact_mask_labeled,            
+        )
+    )
+
+    bottom_row = np.hstack(
+        (
+            depth_labeled,
+            horizontal_spacer,
+            marker_labeled,
+        )
+    )
+
+    display_frame = np.vstack((top_row, bottom_row))
+
+    # Scale the display frame
+    display_frame = cv2.resize(
+        display_frame,
+        (
+            int(display_frame.shape[1] * config.cv_image_stack_scale),
+            int(display_frame.shape[0] * config.cv_image_stack_scale),
+        ),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    display_frame = display_frame.astype(np.uint8)
+
+    # Show the combined image.
+    cv2.imshow(window_title, display_frame)
+
+    # depth_map 반환
+    return depth_map
+
+
+def View3D(config: ConfigModel):
+    WINDOW_TITLE = "Multi-View (Camera, Contact, Depth)"
+
+    reconstruction = Reconstruction3D(
+        image_width=config.camera_width,
+        image_height=config.camera_height,
+        use_gpu=config.use_gpu,  # Change to True if you want to use CUDA.
+    )
+
+    # Load the trained network using the existing method in reconstruction.py.
+    if reconstruction.load_nn(config.nn_model_path) is None:
+        log_message("Failed to load model. Exiting.")
+        return
+
+    marker_tracker = None
+    marker_tracker_initialized = False
+    p0 = None
+    old_gray = None
+    Ox, Oy = None, None
+    lk_params = dict(
+        winSize=(15,15),
+        maxLevel=2,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+    )
+    current_marker_positions = None
+
+    if config.pointcloud_enabled:
+        # Initialize the 3D Visualizer.
+        visualizer3D = Visualize3D(
+            pointcloud_size_x=config.camera_width,
+            pointcloud_size_y=config.camera_height,
+            save_path="",  # Provide a path if you want to save point clouds.
+            window_width=int(config.pointcloud_window_scale * config.camera_width),
+            window_height=int(config.pointcloud_window_scale * config.camera_height),
+        )
+    else:
+        visualizer3D = None
+
+    cmap = color_map_from_txt(
+        path=config.cmap_txt_path, is_bgr=config.cmap_in_BGR_format
+    )
+
+    # Initialize the camera stream.
+    cam_stream = GelSightMini(
+        target_width=config.camera_width, target_height=config.camera_height
+    )
+    devices = cam_stream.get_device_list()
+    log_message(f"Available camera devices: {devices}")
+    # For testing, select device index 0 (adjust if needed).
+    cam_stream.select_device(config.default_camera_index)
+    cam_stream.start()
+
+    # save directory 설정
+    SAVE_DIR = "/home/junwon/Projects/test"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    date_str = datetime.now().strftime("%m%d%H%M")
+    save_counter = 0
+
+    # Main loop: capture frames, compute depth map, and update the 3D view.
+    try:
+        while True:
+            # Get a new frame from the camera.
+            frame = cam_stream.update(dt=0)
+            if frame is None:
+                continue
+
+            # Convert color
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            marker_frame = frame.copy()
+
+            if not marker_tracker_initialized:
+                log_message("Initializing MarkerTracker")
+                img = np.float32(frame) / 255.0
+                marker_tracker = MarkerTracker(img)
+
+                initial_centers = marker_tracker.initial_marker_center
+                Ox = initial_centers[:, 1]
+                Oy = initial_centers[:, 0]
+                nct = len(initial_centers)
+
+                p0 = np.array([[Ox[0], Oy[0]]], np.float32).reshape(-1, 1, 2)
+
+                old_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                marker_tracker_initialized = True
+                
+                for i in range(nct - 1):
+                    # New point to be added
+                    new_point = np.array(
+                        [[Ox[i + 1], Oy[i + 1]]], np.float32
+                    ).reshape(-1, 1, 2)
+                    # Append new point to p0
+                    p0 = np.append(p0, new_point, axis=0)
+
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **lk_params)
+
+            good_new = p1[st==1]
+            good_old = p0[st==1]
+
+            current_marker_positions = good_new
+
+            for i, (new, old) in enumerate(zip(good_new, good_old)):
+                a, b = new.ravel()
+                ix, iy = int(Ox[i]), int(Oy[i])
+                cv2.arrowedLine(marker_frame, (ix,iy), (int(a), int(b)), (255,255,255), thickness=1, line_type=cv2.LINE_8, tipLength=0.2)
+
+            old_gray = frame_gray.copy()
+            p0 = good_new.reshape(-1,1,2)
+
+            depth_map = UpdateView(
+                image=frame,
+                cam_stream=cam_stream,
+                reconstruction=reconstruction,
+                visualizer3D=visualizer3D,
+                cmap=cmap,
+                config=config,
+                window_title=WINDOW_TITLE,
+                marker_frame=marker_frame,
+            )
+
+            key = cv2.waitKey(1) & 0xFF
+
+            # Exit conditions.
+            # When press 'q' on keyboard
+            if key == ord("q"):
+                log_message(f"exit conditions")
+                break
+
+            if key == ord("r"):
+                marker_tracker_initialized = False
+                log_message("Marker tracking reset")
+
+            # save when press "s" on keyboard
+            if key == ord("s"):
+                # save depth_map
+                filename = f"{date_str}_{save_counter}"
+                depth_filename = os.path.join(SAVE_DIR, f"depth_{filename}.npy")
+                np.save(depth_filename, depth_map)
+
+                depth_filename = os.path.join(SAVE_DIR, f"depth_{filename}.csv")
+                np.savetxt(
+                    depth_filename,
+                    depth_map,
+                    delimiter=",",
+                    fmt="%.2f"
+                )
+
+                # save pointcloud
+                if visualizer3D:
+                    pcd_filename = os.path.join(SAVE_DIR, f"pcd_{filename}.pcd")
+                    visualizer3D.save_pointcloud(pcd_filename)
+                
+                # save img
+                rgb_filename = os.path.join(SAVE_DIR, f"rgb_{filename}.png")
+                img2save = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(rgb_filename, img2save)
+                
+
+                # save marker
+                if True:
+                    num_markers = current_marker_positions.shape[0]
+                    tracker_filename = os.path.join(SAVE_DIR, f"tracker_{filename}.npy")
+                    np.save(tracker_filename, current_marker_positions)
+
+                    csv_data = current_marker_positions.reshape(1, num_markers * 2)
+                    csv_filepath = os.path.join(SAVE_DIR, f"tracker_{filename}.csv")
+                    # Use fmt to specify formatting for each number (e.g. '%.4f')
+                    np.savetxt(
+                        csv_filepath,
+                        csv_data,
+                        delimiter=",",
+                        fmt="%.2f",
+                        )
+
+                marker_filename = os.path.join(SAVE_DIR, f"tracker_{filename}.png")
+                marker_img2save = cv2.cvtColor(marker_frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(marker_filename, marker_img2save)
+
+                log_message(f"Saved data depth & pcd & rgb to {SAVE_DIR} folder.")
+                save_counter += 1
+            
+            # Check if the window has been closed by the user.
+            # cv2.getWindowProperty returns a value < 1 when the window is closed.
+            if cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
+                # workaround to better catch widnow exit request
+                for _ in range(5):
+                    cv2.waitKey(1)
+                break
+
+    except KeyboardInterrupt:
+        log_message("Exiting...")
+    finally:
+        # Release the camera and close windows.
+        if cam_stream.camera is not None:
+            cam_stream.camera.release()
+        cv2.destroyAllWindows()
+        if visualizer3D:
+            visualizer3D.visualizer.destroy_window()
+
+
+if __name__ == "__main__":
+    import argparse
+    from config import GSConfig
+
+    parser = argparse.ArgumentParser(
+        description="Run the Gelsight Mini Viewer with an optional config file."
+    )
+    parser.add_argument(
+        "--gs-config",
+        type=str,
+        default=None,
+        help="Path to the JSON configuration file. If not provided, default config is used.",
+    )
+
+    args = parser.parse_args()
+
+    if args.gs_config is not None:
+        log_message(f"Provided config path: {args.gs_config}")
+    else:
+        log_message(f"Didn't provide custom config path.")
+        log_message(
+            f"Using default config path './default_config.json' if such file exists."
+        )
+        log_message(
+            f"Using default_config variable from 'config.py' if './default_config.json' is not available"
+        )
+        args.gs_config = "default_config.json"
+
+    gs_config = GSConfig(args.gs_config)
+    View3D(config=gs_config.config)
